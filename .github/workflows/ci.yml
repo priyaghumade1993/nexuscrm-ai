@@ -1,0 +1,238 @@
+name: NexusCRM AI — CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/nexuscrm-ai
+
+jobs:
+
+  # ── Lint & Type Check ────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install ruff mypy
+
+      - name: Run ruff (linter + formatter check)
+        run: ruff check backend/app/ --select E,F,W,I
+
+      - name: Run mypy (type checking)
+        run: mypy backend/app/ --ignore-missing-imports --no-strict-optional
+        continue-on-error: true  # type errors are warnings, not blocking
+
+  # ── Unit Tests ───────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    env:
+      # Fake credentials for unit tests (never real keys in CI)
+      OPENAI_API_KEY: sk-test-ci-fake-key
+      DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/nexuscrm_test
+      DATABASE_URL_SYNC: postgresql+psycopg2://test:test@localhost:5432/nexuscrm_test
+      SECRET_KEY: ci-test-secret-key-minimum-32-characters-here
+      LANGCHAIN_TRACING_V2: "false"
+      VECTOR_STORE: faiss
+      EMBEDDING_PROVIDER: huggingface
+      HF_EMBEDDING_MODEL: all-MiniLM-L6-v2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --break-system-packages \
+            fastapi sqlalchemy asyncpg psycopg2-binary \
+            langchain langchain-openai langchain-community \
+            langgraph langsmith \
+            python-jose passlib bcrypt \
+            pydantic pydantic-settings \
+            motor \
+            pytest pytest-asyncio pytest-cov \
+            sentence-transformers \
+            faiss-cpu
+        working-directory: backend
+
+      - name: Run unit tests
+        run: |
+          cd backend
+          pytest ../tests/unit/ -v \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -x
+        env:
+          PYTHONPATH: backend
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ── Integration Tests (with real DBs) ────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: nexuscrm_test
+          POSTGRES_USER: nexuscrm_user
+          POSTGRES_PASSWORD: nexuscrm_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      mongo:
+        image: mongo:7.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: nexuscrm_user
+          MONGO_INITDB_ROOT_PASSWORD: nexuscrm_test_password
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand({ping: 1})'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 5
+
+    env:
+      OPENAI_API_KEY: sk-test-ci-fake-key
+      DATABASE_URL: postgresql+asyncpg://nexuscrm_user:nexuscrm_test_password@localhost:5432/nexuscrm_test
+      DATABASE_URL_SYNC: postgresql+psycopg2://nexuscrm_user:nexuscrm_test_password@localhost:5432/nexuscrm_test
+      MONGODB_URL: mongodb://nexuscrm_user:nexuscrm_test_password@localhost:27017/nexuscrm_test?authSource=admin
+      MONGODB_DB_NAME: nexuscrm_test
+      SECRET_KEY: ci-test-secret-key-minimum-32-characters-here
+      LANGCHAIN_TRACING_V2: "false"
+      VECTOR_STORE: faiss
+      EMBEDDING_PROVIDER: huggingface
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install fastapi sqlalchemy asyncpg psycopg2-binary alembic motor langchain langgraph langchain-openai langchain-community python-jose passlib bcrypt pydantic pydantic-settings pytest pytest-asyncio httpx faiss-cpu sentence-transformers
+
+      - name: Run Alembic migrations
+        working-directory: .
+        run: alembic upgrade head
+
+      - name: Run integration tests
+        run: |
+          cd backend
+          pytest ../tests/integration/ -v --timeout=60
+        env:
+          PYTHONPATH: backend
+
+  # ── Docker Build ──────────────────────────────────────────────────────────────
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Deploy to AWS (main branch only) ─────────────────────────────────────────
+  deploy:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-latest
+    needs: [docker-build, integration-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster nexuscrm-production \
+            --service nexuscrm-backend \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Wait for deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster nexuscrm-production \
+            --services nexuscrm-backend \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Notify on success
+        if: success()
+        run: echo "✅ Deployed to production successfully"

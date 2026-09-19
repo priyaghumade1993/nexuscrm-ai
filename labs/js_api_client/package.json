@@ -1,0 +1,23 @@
+{
+  "name": "nexuscrm-js-client",
+  "version": "1.0.0",
+  "description": "NexusCRM AI — TypeScript API client (Lab 02)",
+  "main": "dist/client.js",
+  "types": "dist/client.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "demo": "ts-node client.ts",
+    "demo:offline": "NEXUSCRM_OFFLINE=1 ts-node client.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["crm", "typescript", "api-client", "langchain"],
+  "author": "NexusCRM AI Portfolio",
+  "license": "MIT"
+}

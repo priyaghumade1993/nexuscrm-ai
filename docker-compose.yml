@@ -1,0 +1,166 @@
+version: "3.9"
+
+# NexusCRM AI — Docker Compose (Development + Demo)
+#
+# SERVICES:
+#   db        — PostgreSQL 15 (primary relational store)
+#   mongo     — MongoDB 7.0 (conversation history + audit logs)
+#   backend   — FastAPI application
+#   frontend  — Streamlit UI
+#
+# USAGE:
+#   cp .env.example .env      # Fill in OPENAI_API_KEY at minimum
+#   docker compose up -d      # Start all services
+#   docker compose logs -f backend  # View backend logs
+#
+# PORTS:
+#   8000 — FastAPI API + Swagger UI
+#   8501 — Streamlit frontend
+#   5432 — PostgreSQL (for external tools like DBeaver)
+#   27017 — MongoDB (for MongoDB Compass)
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: nexuscrm_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nexuscrm}
+      POSTGRES_USER: ${POSTGRES_USER:-nexuscrm_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexuscrm_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexuscrm_user} -d ${POSTGRES_DB:-nexuscrm}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexuscrm_net
+
+  # ── MongoDB ─────────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7.0
+    container_name: nexuscrm_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-nexuscrm_user}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-nexuscrm_dev_password}
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-nexuscrm}
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - nexuscrm_net
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: nexuscrm_backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    environment:
+      # App
+      APP_NAME: NexusCRM AI
+      ENVIRONMENT: development
+      DEBUG: "true"
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production-minimum-32-chars}
+      # Database
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nexuscrm_user}:${POSTGRES_PASSWORD:-nexuscrm_dev_password}@db:5432/${POSTGRES_DB:-nexuscrm}
+      DATABASE_URL_SYNC: postgresql+psycopg2://${POSTGRES_USER:-nexuscrm_user}:${POSTGRES_PASSWORD:-nexuscrm_dev_password}@db:5432/${POSTGRES_DB:-nexuscrm}
+      # MongoDB
+      MONGODB_URL: mongodb://${MONGO_USER:-nexuscrm_user}:${MONGO_PASSWORD:-nexuscrm_dev_password}@mongo:27017/${MONGO_DB:-nexuscrm}?authSource=admin
+      MONGODB_DB_NAME: ${MONGO_DB:-nexuscrm}
+      # OpenAI (required for AI features)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      # Vector store
+      VECTOR_STORE: ${VECTOR_STORE:-faiss}
+      FAISS_INDEX_PATH: /app/data/faiss
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-huggingface}
+      HF_EMBEDDING_MODEL: ${HF_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      # LangSmith (optional)
+      LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
+      LANGCHAIN_PROJECT: ${LANGCHAIN_PROJECT:-nexuscrm-ai}
+    volumes:
+      - faiss_data:/app/data/faiss
+      - ./knowledge_base:/app/knowledge_base:ro
+      - ./evaluation_results:/app/evaluation_results
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    networks:
+      - nexuscrm_net
+    command: >
+      sh -c "
+        echo 'Running Alembic migrations...' &&
+        cd /app &&
+        alembic upgrade head &&
+        echo 'Starting FastAPI...' &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+      "
+
+  # ── Streamlit Frontend ───────────────────────────────────────────────────────
+  frontend:
+    image: python:3.11-slim
+    container_name: nexuscrm_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      API_BASE_URL: http://backend:8000
+    volumes:
+      - ./frontend:/app/frontend
+      - ./backend:/app/backend
+    ports:
+      - "8501:8501"
+    working_dir: /app
+    networks:
+      - nexuscrm_net
+    command: >
+      sh -c "
+        pip install streamlit requests pandas --quiet &&
+        streamlit run frontend/streamlit/app.py
+          --server.port 8501
+          --server.address 0.0.0.0
+          --server.headless true
+          --browser.gatherUsageStats false
+      "
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    name: nexuscrm_postgres_data
+  mongo_data:
+    name: nexuscrm_mongo_data
+  faiss_data:
+    name: nexuscrm_faiss_data
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  nexuscrm_net:
+    name: nexuscrm_network
+    driver: bridge
