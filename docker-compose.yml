@@ -33,7 +33,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexuscrm_user} -d ${POSTGRES_DB:-nexuscrm}"]
       interval: 10s
@@ -105,7 +105,7 @@ services:
       - ./knowledge_base:/app/knowledge_base:ro
       - ./evaluation_results:/app/evaluation_results
     ports:
-      - "8000:8000"
+      - "8001:8000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -136,7 +136,7 @@ services:
       - ./frontend:/app/frontend
       - ./backend:/app/backend
     ports:
-      - "8501:8501"
+      - "8502:8501"
     working_dir: /app
     networks:
       - nexuscrm_net
